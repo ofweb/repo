@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -6,6 +5,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -23,21 +24,56 @@ struct Paths {
     ssh_config_dir: PathBuf,
 }
 
-#[derive(Debug, Clone)]
-struct RepoConfig {
-    name: String,
-    project: PathBuf,
-    git_url: String,
-    clone_url: String,
-    account: Option<String>,
-    key_file: Option<PathBuf>,
-    host_alias: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct RepoName(String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct AccountName(String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct GitHubRepoUrl(String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct SshHostAlias(String);
+
+impl RepoName {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-#[derive(Debug, Clone)]
+impl AccountName {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoConfig {
+    name: RepoName,
+    project: PathBuf,
+    git_url: GitHubRepoUrl,
+    clone_url: String,
+    account: Option<AccountName>,
+    key_file: Option<PathBuf>,
+    host_alias: Option<SshHostAlias>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountConfig {
     git_user_name: String,
     git_user_email: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitHubRepo {
+    owner: String,
+    repo: String,
+    path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,10 +84,7 @@ enum Cli {
         account: Option<String>,
     },
     Add {
-        name: String,
         github_url: String,
-        account: Option<String>,
-        project: Option<String>,
     },
     Clone {
         name: String,
@@ -104,18 +137,7 @@ fn run(args: Vec<OsString>) -> Result<()> {
             project,
             account,
         } => cmd_register(&paths, &name, &project, account.as_deref()),
-        Cli::Add {
-            name,
-            github_url,
-            account,
-            project,
-        } => cmd_add(
-            &paths,
-            &name,
-            &github_url,
-            account.as_deref(),
-            project.as_deref(),
-        ),
+        Cli::Add { github_url } => cmd_add(&paths, &github_url),
         Cli::Clone { name } => cmd_clone(&paths, &name),
         Cli::Key { name } => cmd_key(&paths, &name),
         Cli::List => cmd_list(&paths),
@@ -159,25 +181,10 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             _ => Err("usage: repo register NAME PROJECT_DIR [ACCOUNT]".to_string()),
         },
         "add" => match args.as_slice() {
-            [_, name, github_url] => Ok(Cli::Add {
-                name: name.clone(),
+            [_, github_url] => Ok(Cli::Add {
                 github_url: github_url.clone(),
-                account: None,
-                project: None,
             }),
-            [_, name, github_url, account] => Ok(Cli::Add {
-                name: name.clone(),
-                github_url: github_url.clone(),
-                account: Some(account.clone()),
-                project: None,
-            }),
-            [_, name, github_url, account, project] => Ok(Cli::Add {
-                name: name.clone(),
-                github_url: github_url.clone(),
-                account: Some(account.clone()),
-                project: Some(project.clone()),
-            }),
-            _ => Err("usage: repo add NAME GITHUB_URL [ACCOUNT] [PROJECT_DIR]".to_string()),
+            _ => Err("usage: repo add GITHUB_URL".to_string()),
         },
         "clone" => match args.as_slice() {
             [_, name] => Ok(Cli::Clone { name: name.clone() }),
@@ -241,7 +248,7 @@ fn print_usage() {
         "\
 usage:
   repo register NAME PROJECT_DIR [ACCOUNT]
-  repo add NAME GITHUB_URL [ACCOUNT] [PROJECT_DIR]
+  repo add GITHUB_URL
   repo clone NAME
   repo key NAME
   repo list
@@ -263,7 +270,7 @@ environment:
 examples:
   repo account add main \"Your Name\" \"you@example.com\"
   repo register windlass ~/code/windlass main
-  repo add parts git@github.com:owner/parts.git main
+  repo add git@github.com:owner/parts.git
   repo key parts
   repo clone parts
   repo codex parts"
@@ -298,11 +305,11 @@ impl Paths {
     }
 
     fn repo_config_path(&self, name: &str) -> PathBuf {
-        self.repo_dir.join(format!("{name}.env"))
+        self.repo_dir.join(format!("{name}.toml"))
     }
 
     fn account_config_path(&self, name: &str) -> PathBuf {
-        self.account_dir.join(format!("{name}.env"))
+        self.account_dir.join(format!("{name}.toml"))
     }
 }
 
@@ -315,18 +322,20 @@ fn cmd_account_add(
     ensure_dirs(paths)?;
     validate_name(name, "account")?;
 
-    let values = [
-        ("GIT_USER_NAME", git_user_name),
-        ("GIT_USER_EMAIL", git_user_email),
-    ];
-    write_env_file(&paths.account_config_path(name), &values)?;
+    write_toml_file(
+        &paths.account_config_path(name),
+        &AccountConfig {
+            git_user_name: git_user_name.to_string(),
+            git_user_email: git_user_email.to_string(),
+        },
+    )?;
     println!("Saved account: {name}");
     Ok(())
 }
 
 fn cmd_account_list(paths: &Paths) -> Result<()> {
     ensure_dirs(paths)?;
-    for name in list_env_names(&paths.account_dir)? {
+    for name in list_config_names(&paths.account_dir)? {
         println!("{name}");
     }
     Ok(())
@@ -350,13 +359,14 @@ fn cmd_register(paths: &Paths, name: &str, project: &str, account: Option<&str>)
     .map_err(|_| format!("repo has no origin remote: {}", project.display()))?;
 
     let repo = RepoConfig {
-        name: name.to_string(),
+        name: RepoName(name.to_string()),
         project: project.clone(),
-        git_url: git_url.clone(),
+        git_url: GitHubRepoUrl(git_url.clone()),
         clone_url: git_url,
         account: account
             .map(str::to_string)
-            .filter(|value| !value.is_empty()),
+            .filter(|value| !value.is_empty())
+            .map(AccountName),
         key_file: None,
         host_alias: None,
     };
@@ -368,26 +378,23 @@ fn cmd_register(paths: &Paths, name: &str, project: &str, account: Option<&str>)
     Ok(())
 }
 
-fn cmd_add(
-    paths: &Paths,
-    name: &str,
-    git_url: &str,
-    account: Option<&str>,
-    project: Option<&str>,
-) -> Result<()> {
+fn cmd_add(paths: &Paths, git_url: &str) -> Result<()> {
     need("ssh-keygen")?;
     ensure_ssh_include(paths)?;
-    validate_name(name, "repo")?;
 
-    let project = match project {
-        Some(project) => normalize_path(project)?,
-        None => paths.code_dir.join(name),
-    };
-    let github_path = github_path_from_url(git_url)?;
+    let github = github_repo_from_url(git_url)?;
+    let name = github.repo.as_str();
+    let account = github.owner.as_str();
+
+    validate_name(name, "repo")?;
+    validate_name(account, "account")?;
+
+    let project = paths.code_dir.join(name);
     let host_alias = format!("github-{name}");
     let key_file = paths.key_dir.join(name);
-    let clone_url = format!("git@{host_alias}:{github_path}");
+    let clone_url = format!("git@{host_alias}:{}", github.path);
     let ssh_file = paths.ssh_config_dir.join(format!("repo-llm-{name}.conf"));
+    ensure_add_targets_available(paths, name, &key_file, &ssh_file)?;
 
     if !key_file.exists() {
         let status = Command::new("ssh-keygen")
@@ -416,22 +423,20 @@ fn cmd_add(
     chmod_if_exists(&ssh_file, 0o600);
 
     let repo = RepoConfig {
-        name: name.to_string(),
+        name: RepoName(name.to_string()),
         project,
-        git_url: git_url.to_string(),
+        git_url: GitHubRepoUrl(git_url.to_string()),
         clone_url,
-        account: account
-            .map(str::to_string)
-            .filter(|value| !value.is_empty()),
+        account: Some(AccountName(account.to_string())),
         key_file: Some(key_file.clone()),
-        host_alias: Some(host_alias),
+        host_alias: Some(SshHostAlias(host_alias)),
     };
     write_repo_config(paths, &repo)?;
 
     println!("Created repo config: {name}");
     println!();
     println!("Paste this public key into GitHub as a deploy key for:");
-    println!("  {github_path}");
+    println!("  {}", github.path);
     println!();
     print_file(key_file.with_extension("pub"))?;
     println!();
@@ -439,6 +444,35 @@ fn cmd_add(
     println!("  repo clone {name}");
     println!("  repo codex {name}");
     Ok(())
+}
+
+fn ensure_add_targets_available(
+    paths: &Paths,
+    name: &str,
+    key_file: &Path,
+    ssh_file: &Path,
+) -> Result<()> {
+    let public_key = key_file.with_extension("pub");
+    let candidates = [
+        ("repo config", paths.repo_config_path(name)),
+        ("private key", key_file.to_path_buf()),
+        ("public key", public_key),
+        ("ssh config", ssh_file.to_path_buf()),
+    ];
+    let existing: Vec<String> = candidates
+        .into_iter()
+        .filter(|(_, path)| path.exists())
+        .map(|(label, path)| format!("{label}: {}", path.display()))
+        .collect();
+
+    if existing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to overwrite existing repo add files:\n  {}",
+            existing.join("\n  ")
+        ))
+    }
 }
 
 fn cmd_key(paths: &Paths, name: &str) -> Result<()> {
@@ -477,16 +511,20 @@ fn cmd_clone(paths: &Paths, name: &str) -> Result<()> {
         return Err(format!("git clone failed with status {status}"));
     }
 
-    apply_account(paths, &repo.project, repo.account.as_deref())?;
+    apply_account(
+        paths,
+        &repo.project,
+        repo.account.as_ref().map(AccountName::as_str),
+    )?;
     println!("Cloned: {}", repo.project.display());
     Ok(())
 }
 
 fn cmd_list(paths: &Paths) -> Result<()> {
     ensure_dirs(paths)?;
-    for name in list_env_names(&paths.repo_dir)? {
+    for name in list_config_names(&paths.repo_dir)? {
         let repo = load_repo(paths, &name)?;
-        println!("{:<20} {}", repo.name, repo.project.display());
+        println!("{:<20} {}", repo.name.as_str(), repo.project.display());
     }
     Ok(())
 }
@@ -534,33 +572,14 @@ fn load_repo(paths: &Paths, name: &str) -> Result<RepoConfig> {
         return Err(format!("unknown repo: {name}"));
     }
 
-    let values = read_env_file(&file)?;
-    let get = |key: &str| {
-        values
-            .get(key)
-            .cloned()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("broken repo config: missing {key}"))
-    };
-
-    Ok(RepoConfig {
-        name: get("NAME")?,
-        project: PathBuf::from(get("PROJECT")?),
-        git_url: get("GIT_URL")?,
-        clone_url: get("CLONE_URL")?,
-        account: values
-            .get("ACCOUNT")
-            .cloned()
-            .filter(|value| !value.is_empty()),
-        key_file: values
-            .get("KEY_FILE")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from),
-        host_alias: values
-            .get("HOST_ALIAS")
-            .cloned()
-            .filter(|value| !value.is_empty()),
-    })
+    let repo: RepoConfig = read_toml_file(&file)?;
+    if repo.name.as_str().is_empty() {
+        return Err("broken repo config: missing name".to_string());
+    }
+    if repo.clone_url.is_empty() {
+        return Err("broken repo config: missing clone_url".to_string());
+    }
+    Ok(repo)
 }
 
 fn load_account_if_present(paths: &Paths, account: Option<&str>) -> Result<Option<AccountConfig>> {
@@ -572,44 +591,11 @@ fn load_account_if_present(paths: &Paths, account: Option<&str>) -> Result<Optio
         return Ok(None);
     }
 
-    let values = read_env_file(&file)?;
-    let Some(git_user_name) = values
-        .get("GIT_USER_NAME")
-        .cloned()
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(git_user_email) = values
-        .get("GIT_USER_EMAIL")
-        .cloned()
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-    Ok(Some(AccountConfig {
-        git_user_name,
-        git_user_email,
-    }))
+    Ok(Some(read_toml_file(&file)?))
 }
 
 fn write_repo_config(paths: &Paths, repo: &RepoConfig) -> Result<()> {
-    let project = repo.project.to_string_lossy();
-    let key_file = repo
-        .key_file
-        .as_ref()
-        .map(|path| path.to_string_lossy())
-        .unwrap_or_default();
-    let values = [
-        ("NAME", repo.name.as_str()),
-        ("PROJECT", project.as_ref()),
-        ("GIT_URL", repo.git_url.as_str()),
-        ("CLONE_URL", repo.clone_url.as_str()),
-        ("ACCOUNT", repo.account.as_deref().unwrap_or("")),
-        ("KEY_FILE", key_file.as_ref()),
-        ("HOST_ALIAS", repo.host_alias.as_deref().unwrap_or("")),
-    ];
-    write_env_file(&paths.repo_config_path(&repo.name), &values)
+    write_toml_file(&paths.repo_config_path(repo.name.as_str()), repo)
 }
 
 fn apply_account(paths: &Paths, project: &Path, account: Option<&str>) -> Result<()> {
@@ -685,7 +671,7 @@ fn ensure_ssh_include(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn github_path_from_url(url: &str) -> Result<String> {
+fn github_repo_from_url(url: &str) -> Result<GitHubRepo> {
     let path = if let Some(path) = url.strip_prefix("git@github.com:") {
         path
     } else if let Some(path) = url.strip_prefix("ssh://git@github.com/") {
@@ -710,7 +696,11 @@ fn github_path_from_url(url: &str) -> Result<String> {
     {
         return Err(format!("could not parse GitHub owner/repo from: {url}"));
     }
-    Ok(format!("{owner}/{repo}.git"))
+    Ok(GitHubRepo {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        path: format!("{owner}/{repo}.git"),
+    })
 }
 
 fn validate_name(name: &str, kind: &str) -> Result<()> {
@@ -743,118 +733,27 @@ fn llm_name(llm: Llm) -> &'static str {
     }
 }
 
-fn read_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
+fn read_toml_file<T>(path: &Path) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let mut content = String::new();
     File::open(path)
         .and_then(|mut file| file.read_to_string(&mut content))
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-
-    let mut values = BTreeMap::new();
-    for (index, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            return Err(format!(
-                "{}:{}: expected KEY=VALUE",
-                path.display(),
-                index + 1
-            ));
-        };
-        values.insert(
-            key.to_string(),
-            parse_shell_value(value)
-                .map_err(|err| format!("{}:{}: {err}", path.display(), index + 1))?,
-        );
-    }
-    Ok(values)
+    toml::from_str(&content).map_err(|err| format!("failed to parse {}: {err}", path.display()))
 }
 
-fn write_env_file(path: &Path, values: &[(&str, &str)]) -> Result<()> {
-    let mut content = String::new();
-    for (key, value) in values {
-        content.push_str(key);
-        content.push('=');
-        content.push_str(&shell_quote(value));
-        content.push('\n');
-    }
+fn write_toml_file<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let content =
+        toml::to_string_pretty(value).map_err(|err| format!("failed to encode TOML: {err}"))?;
     write_file(path, &content)
 }
 
-fn parse_shell_value(value: &str) -> Result<String> {
-    if let Some(rest) = value.strip_prefix("$'") {
-        if let Some(inner) = rest.strip_suffix('\'') {
-            return parse_ansi_c_quoted(inner);
-        }
-    }
-
-    let mut out = String::new();
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    out.push(next);
-                }
-            }
-            '\'' => {
-                for next in chars.by_ref() {
-                    if next == '\'' {
-                        break;
-                    }
-                    out.push(next);
-                }
-            }
-            '"' => {
-                let iter = chars.by_ref();
-                while let Some(next) = iter.next() {
-                    match next {
-                        '"' => break,
-                        '\\' => {
-                            if let Some(escaped) = iter.next() {
-                                out.push(escaped);
-                            }
-                        }
-                        _ => out.push(next),
-                    }
-                }
-            }
-            _ => out.push(ch),
-        }
-    }
-    Ok(out)
-}
-
-fn parse_ansi_c_quoted(value: &str) -> Result<String> {
-    let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some(other) => out.push(other),
-            None => return Err("unterminated escape in quoted value".to_string()),
-        }
-    }
-    Ok(out)
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn list_env_names(dir: &Path) -> Result<Vec<String>> {
+fn list_config_names(dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in
         fs::read_dir(dir).map_err(|err| format!("failed to read {}: {err}", dir.display()))?
@@ -862,7 +761,7 @@ fn list_env_names(dir: &Path) -> Result<Vec<String>> {
         let entry =
             entry.map_err(|err| format!("failed to read entry in {}: {err}", dir.display()))?;
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("env") {
+        if path.extension().and_then(|value| value.to_str()) == Some("toml") {
             if let Some(name) = path.file_stem().and_then(|value| value.to_str()) {
                 names.push(name.to_string());
             }
@@ -1000,35 +899,66 @@ mod tests {
     #[test]
     fn parses_github_urls() {
         assert_eq!(
-            github_path_from_url("git@github.com:owner/project.git").unwrap(),
-            "owner/project.git"
+            github_repo_from_url("git@github.com:owner/project.git").unwrap(),
+            GitHubRepo {
+                owner: "owner".to_string(),
+                repo: "project".to_string(),
+                path: "owner/project.git".to_string()
+            }
         );
         assert_eq!(
-            github_path_from_url("https://github.com/owner/project").unwrap(),
-            "owner/project.git"
+            github_repo_from_url("https://github.com/owner/project").unwrap(),
+            GitHubRepo {
+                owner: "owner".to_string(),
+                repo: "project".to_string(),
+                path: "owner/project.git".to_string()
+            }
         );
-        assert!(github_path_from_url("https://example.com/owner/project").is_err());
+        assert!(github_repo_from_url("https://example.com/owner/project").is_err());
     }
 
     #[test]
-    fn validates_names_like_the_shell_script() {
+    fn validates_config_names() {
         assert!(validate_name("repo_1.2-test", "repo").is_ok());
         assert!(validate_name("../nope", "repo").is_err());
         assert!(validate_name("", "repo").is_err());
     }
 
     #[test]
-    fn parses_existing_bash_percent_q_values() {
-        assert_eq!(parse_shell_value(r"Your\ Name").unwrap(), "Your Name");
-        assert_eq!(parse_shell_value(r#""Your Name""#).unwrap(), "Your Name");
-        assert_eq!(parse_shell_value(r"$'line\nnext'").unwrap(), "line\nnext");
-    }
+    fn writes_repo_config_as_toml() {
+        let root = temp_test_dir("repo-cli-toml");
+        let paths = Paths {
+            app_dir: root.join("config"),
+            repo_dir: root.join("config/repos.d"),
+            account_dir: root.join("config/accounts.d"),
+            key_dir: root.join("keys"),
+            code_dir: root.join("code"),
+            ssh_config: root.join(".ssh/config"),
+            ssh_config_dir: root.join(".ssh/config.d"),
+        };
+        fs::create_dir_all(&paths.repo_dir).unwrap();
 
-    #[test]
-    fn writes_shell_sourceable_values() {
-        assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("abc"), "'abc'");
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        let repo = RepoConfig {
+            name: RepoName("windlass".to_string()),
+            project: PathBuf::from("/home/ofweb/code/windlass"),
+            git_url: GitHubRepoUrl("git@github.com:ofweb/windlass.git".to_string()),
+            clone_url: "git@github-windlass:ofweb/windlass.git".to_string(),
+            account: Some(AccountName("ofweb".to_string())),
+            key_file: Some(PathBuf::from("/home/ofweb/.ssh/deploy_keys/windlass")),
+            host_alias: Some(SshHostAlias("github-windlass".to_string())),
+        };
+
+        write_repo_config(&paths, &repo).unwrap();
+        let content = fs::read_to_string(paths.repo_config_path("windlass")).unwrap();
+        assert!(content.contains("name = \"windlass\""));
+        assert!(content.contains("project = \"/home/ofweb/code/windlass\""));
+        assert!(content.contains("account = \"ofweb\""));
+
+        let loaded = load_repo(&paths, "windlass").unwrap();
+        assert_eq!(loaded.name.as_str(), "windlass");
+        assert_eq!(loaded.git_url.0, "git@github.com:ofweb/windlass.git");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1040,5 +970,54 @@ mod tests {
                 llm: Llm::Codex
             }
         );
+    }
+
+    #[test]
+    fn parses_cli_add_from_url_only() {
+        assert_eq!(
+            parse_cli(vec!["add".into(), "git@github.com:ofweb/repo.git".into()]).unwrap(),
+            Cli::Add {
+                github_url: "git@github.com:ofweb/repo.git".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn add_refuses_to_overwrite_existing_files() {
+        let root = temp_test_dir("repo-cli-test");
+        let paths = Paths {
+            app_dir: root.join("config"),
+            repo_dir: root.join("config/repos.d"),
+            account_dir: root.join("config/accounts.d"),
+            key_dir: root.join("keys"),
+            code_dir: root.join("code"),
+            ssh_config: root.join(".ssh/config"),
+            ssh_config_dir: root.join(".ssh/config.d"),
+        };
+        fs::create_dir_all(&paths.repo_dir).unwrap();
+
+        let repo_config = paths.repo_config_path("project");
+        write_file(&repo_config, "name = \"project\"\n").unwrap();
+
+        let key_file = paths.key_dir.join("project");
+        let ssh_file = paths.ssh_config_dir.join("repo-llm-project.conf");
+        let err =
+            ensure_add_targets_available(&paths, "project", &key_file, &ssh_file).unwrap_err();
+
+        assert!(err.contains("refusing to overwrite"));
+        assert!(err.contains(&repo_config.display().to_string()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 }
