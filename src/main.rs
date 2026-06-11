@@ -85,6 +85,7 @@ enum Cli {
     },
     Add {
         github_url: String,
+        project: Option<String>,
     },
     Clone {
         name: String,
@@ -137,7 +138,10 @@ fn run(args: Vec<OsString>) -> Result<()> {
             project,
             account,
         } => cmd_register(&paths, &name, &project, account.as_deref()),
-        Cli::Add { github_url } => cmd_add(&paths, &github_url),
+        Cli::Add {
+            github_url,
+            project,
+        } => cmd_add(&paths, &github_url, project.as_deref()),
         Cli::Clone { name } => cmd_clone(&paths, &name),
         Cli::Key { name } => cmd_key(&paths, &name),
         Cli::List => cmd_list(&paths),
@@ -183,8 +187,13 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         "add" => match args.as_slice() {
             [_, github_url] => Ok(Cli::Add {
                 github_url: github_url.clone(),
+                project: None,
             }),
-            _ => Err("usage: repo add GITHUB_URL".to_string()),
+            [_, github_url, project] => Ok(Cli::Add {
+                github_url: github_url.clone(),
+                project: Some(project.clone()),
+            }),
+            _ => Err("usage: repo add GITHUB_URL [PROJECT_DIR]".to_string()),
         },
         "clone" => match args.as_slice() {
             [_, name] => Ok(Cli::Clone { name: name.clone() }),
@@ -248,7 +257,7 @@ fn print_usage() {
         "\
 usage:
   repo register NAME PROJECT_DIR [ACCOUNT]
-  repo add GITHUB_URL
+  repo add GITHUB_URL [PROJECT_DIR]
   repo clone NAME
   repo key NAME
   repo list
@@ -271,6 +280,7 @@ examples:
   repo account add main \"Your Name\" \"you@example.com\"
   repo register windlass ~/code/windlass main
   repo add git@github.com:owner/parts.git
+  repo add git@github.com:owner/parts.git ~/projects/parts
   repo key parts
   repo clone parts
   repo codex parts"
@@ -378,7 +388,7 @@ fn cmd_register(paths: &Paths, name: &str, project: &str, account: Option<&str>)
     Ok(())
 }
 
-fn cmd_add(paths: &Paths, git_url: &str) -> Result<()> {
+fn cmd_add(paths: &Paths, git_url: &str, project: Option<&str>) -> Result<()> {
     need("ssh-keygen")?;
     ensure_ssh_include(paths)?;
 
@@ -389,7 +399,10 @@ fn cmd_add(paths: &Paths, git_url: &str) -> Result<()> {
     validate_name(name, "repo")?;
     validate_name(account, "account")?;
 
-    let project = paths.code_dir.join(name);
+    let project = match project {
+        Some(project) => normalize_path(project)?,
+        None => paths.code_dir.join(name),
+    };
     let host_alias = format!("github-{name}");
     let key_file = paths.key_dir.join(name);
     let clone_url = format!("git@{host_alias}:{}", github.path);
@@ -491,9 +504,17 @@ fn cmd_clone(paths: &Paths, name: &str) -> Result<()> {
     need("git")?;
     let repo = load_repo(paths, name)?;
 
-    if repo.project.join(".git").is_dir() {
-        println!("Already cloned: {}", repo.project.display());
+    if is_git_repo(&repo.project) {
+        adopt_existing_clone(paths, &repo)?;
+        println!("Using existing clone: {}", repo.project.display());
         return Ok(());
+    }
+
+    if repo.project.exists() {
+        return Err(format!(
+            "project path exists but is not a git repo: {}",
+            repo.project.display()
+        ));
     }
 
     if let Some(parent) = repo.project.parent() {
@@ -518,6 +539,54 @@ fn cmd_clone(paths: &Paths, name: &str) -> Result<()> {
     )?;
     println!("Cloned: {}", repo.project.display());
     Ok(())
+}
+
+fn adopt_existing_clone(paths: &Paths, repo: &RepoConfig) -> Result<()> {
+    let origin = command_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo.project)
+            .args(["remote", "get-url", "origin"]),
+    )
+    .map_err(|_| format!("repo has no origin remote: {}", repo.project.display()))?;
+
+    if origin != repo.clone_url {
+        let expected = github_repo_from_url(&repo.git_url.0)?;
+        let actual = github_repo_from_url(&origin)
+            .map_err(|_| format!("existing repo origin does not point to github.com: {origin}"))?;
+        if actual != expected {
+            return Err(format!(
+                "existing repo origin is {}/{}, expected {}/{}",
+                actual.owner, actual.repo, expected.owner, expected.repo
+            ));
+        }
+
+        command_ok(
+            Command::new("git").arg("-C").arg(&repo.project).args([
+                "remote",
+                "set-url",
+                "origin",
+                &repo.clone_url,
+            ]),
+            "git remote set-url origin",
+        )?;
+    }
+
+    apply_account(
+        paths,
+        &repo.project,
+        repo.account.as_ref().map(AccountName::as_str),
+    )
+}
+
+fn is_git_repo(project: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn cmd_list(paths: &Paths) -> Result<()> {
@@ -761,10 +830,10 @@ fn list_config_names(dir: &Path) -> Result<Vec<String>> {
         let entry =
             entry.map_err(|err| format!("failed to read entry in {}: {err}", dir.display()))?;
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("toml") {
-            if let Some(name) = path.file_stem().and_then(|value| value.to_str()) {
-                names.push(name.to_string());
-            }
+        if path.extension().and_then(|value| value.to_str()) == Some("toml")
+            && let Some(name) = path.file_stem().and_then(|value| value.to_str())
+        {
+            names.push(name.to_string());
         }
     }
     names.sort();
@@ -977,9 +1046,99 @@ mod tests {
         assert_eq!(
             parse_cli(vec!["add".into(), "git@github.com:ofweb/repo.git".into()]).unwrap(),
             Cli::Add {
-                github_url: "git@github.com:ofweb/repo.git".to_string()
+                github_url: "git@github.com:ofweb/repo.git".to_string(),
+                project: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_cli_add_with_existing_project() {
+        assert_eq!(
+            parse_cli(vec![
+                "add".into(),
+                "git@github.com:ofweb/repo.git".into(),
+                "~/projects/repo".into(),
+            ])
+            .unwrap(),
+            Cli::Add {
+                github_url: "git@github.com:ofweb/repo.git".to_string(),
+                project: Some("~/projects/repo".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn adopts_existing_clone() {
+        let root = temp_test_dir("repo-cli-existing-clone");
+        let project = root.join("project");
+        let paths = Paths {
+            app_dir: root.join("config"),
+            repo_dir: root.join("config/repos.d"),
+            account_dir: root.join("config/accounts.d"),
+            key_dir: root.join("keys"),
+            code_dir: root.join("code"),
+            ssh_config: root.join(".ssh/config"),
+            ssh_config_dir: root.join(".ssh/config.d"),
+        };
+        fs::create_dir_all(&paths.account_dir).unwrap();
+        command_ok(
+            Command::new("git").args(["init", project.to_str().unwrap()]),
+            "git init",
+        )
+        .unwrap();
+        command_ok(
+            Command::new("git").arg("-C").arg(&project).args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ofweb/project.git",
+            ]),
+            "git remote add origin",
+        )
+        .unwrap();
+        write_toml_file(
+            &paths.account_config_path("ofweb"),
+            &AccountConfig {
+                git_user_name: "Test User".to_string(),
+                git_user_email: "test@example.com".to_string(),
+            },
+        )
+        .unwrap();
+
+        let repo = RepoConfig {
+            name: RepoName("project".to_string()),
+            project: project.clone(),
+            git_url: GitHubRepoUrl("git@github.com:ofweb/project.git".to_string()),
+            clone_url: "git@github-project:ofweb/project.git".to_string(),
+            account: Some(AccountName("ofweb".to_string())),
+            key_file: None,
+            host_alias: None,
+        };
+
+        adopt_existing_clone(&paths, &repo).unwrap();
+        assert_eq!(
+            command_output(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(["remote", "get-url", "origin"])
+            )
+            .unwrap(),
+            repo.clone_url
+        );
+        assert_eq!(
+            command_output(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(["config", "user.email"])
+            )
+            .unwrap(),
+            "test@example.com"
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
